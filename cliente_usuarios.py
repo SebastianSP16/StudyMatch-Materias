@@ -1,43 +1,82 @@
-import asyncio
+import os
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
+import httpx
+import database
 
-class UsuarioNoEncontrado(Exception): pass
-class ServicioUsuariosNoDisponible(Exception): pass
-class ServicioUsuariosTimeout(Exception): pass
 
-USUARIOS_MOCK = {
-    1: {"usuario_id": 1, "nombre": "Juan Sebastián", "email": "juan@uni.edu",    "password": "1234", "carrera": "Ingeniería de Sistemas", "rol": "estudiante"},
-    2: {"usuario_id": 2, "nombre": "Daniela",        "email": "daniela@uni.edu", "password": "1234", "carrera": "Medicina",               "rol": "estudiante"},
-    3: {"usuario_id": 3, "nombre": "Gustavo",        "email": "gustavo@uni.edu", "password": "1234", "carrera": "Administración de Empresas", "rol": "estudiante"},
-    4: {"usuario_id": 4, "nombre": "Administrador",  "email": "admin@uni.edu",   "password": "admin123", "carrera": "Todas",              "rol": "admin"},
-}
-_next_id = 5
+class UsuarioNoEncontrado(Exception):
+    pass
 
-def autenticar(email: str, password: str):
-    for u in USUARIOS_MOCK.values():
-        if u["email"].lower() == email.lower() and u["password"] == password:
-            return u
-    return None
 
-def crear_usuario(nombre: str, email: str, password: str, carrera: str = "Ingeniería de Sistemas", rol: str = "estudiante") -> int:
-    global _next_id
-    if any(u["email"].lower() == email.lower() for u in USUARIOS_MOCK.values()):
-        raise ValueError("El correo ya está registrado")
-    uid = _next_id; _next_id += 1
-    USUARIOS_MOCK[uid] = {"usuario_id": uid, "nombre": nombre, "email": email, "password": password, "carrera": carrera, "rol": rol}
-    return uid
+class ServicioUsuariosNoDisponible(Exception):
+    pass
 
-def obtener_usuario(uid: int):
-    return USUARIOS_MOCK.get(uid)
 
-async def consultar_usuario(usuario_id: int, *, latencia_ms=0,
-                            simular_timeout=False, simular_caido=False):
-    if latencia_ms and latencia_ms > 0:
-        await asyncio.sleep(latencia_ms / 1000.0)
-    if simular_caido:
-        raise ServicioUsuariosNoDisponible("Servicio Usuarios no disponible temporalmente")
-    if simular_timeout:
-        await asyncio.sleep(6.0)
-        raise ServicioUsuariosTimeout("No se pudo establecer comunicación con Servicio Usuarios (timeout)")
-    if usuario_id not in USUARIOS_MOCK:
-        raise UsuarioNoEncontrado(f"Usuario {usuario_id} no existe en Servicio Usuarios")
-    return USUARIOS_MOCK[usuario_id]
+class ServicioUsuariosTimeout(Exception):
+    pass
+
+
+USUARIOS_SERVICE_URL = os.getenv("USUARIOS_SERVICE_URL", "").rstrip("/")
+USUARIOS_TIMEOUT_SEG = float(os.getenv("USUARIOS_TIMEOUT_SEG", "3.0"))
+
+
+def obtener_usuario_bd(usuario_id: int) -> dict | None:
+    sql = text("""
+        SELECT usuario_id, nombre, apellido, correo, carrera, semestre, foto, estado
+        FROM usuarios
+        WHERE usuario_id = :uid
+    """)
+    with database.SessionLocal() as db:
+        row = db.execute(sql, {"uid": usuario_id}).mappings().fetchone()
+        return dict(row) if row else None
+
+
+def listar_estudiantes_bd() -> list[dict]:
+    sql = text("""
+        SELECT usuario_id, nombre, apellido, correo, carrera, semestre, estado
+        FROM usuarios
+        ORDER BY usuario_id
+    """)
+    with database.SessionLocal() as db:
+        return [dict(r._mapping) for r in db.execute(sql).fetchall()]
+
+
+async def consultar_usuario(usuario_id: int) -> dict:
+    """Consulta un usuario por ID.
+    Si USUARIOS_SERVICE_URL está configurado, consume GET /api/v1/usuarios/{usuario_id};
+    de lo contrario consulta directamente la tabla `usuarios` en PostgreSQL.
+    """
+    if USUARIOS_SERVICE_URL:
+        url = f"{USUARIOS_SERVICE_URL}/api/v1/usuarios/{usuario_id}"
+        try:
+            async with httpx.AsyncClient(timeout=USUARIOS_TIMEOUT_SEG) as client:
+                resp = await client.get(url)
+            if resp.status_code == 404:
+                raise UsuarioNoEncontrado(f"Usuario {usuario_id} no existe en Servicio Usuarios")
+            if resp.status_code >= 500:
+                raise ServicioUsuariosNoDisponible(
+                    f"Servicio Usuarios respondió con estado {resp.status_code}"
+                )
+            resp.raise_for_status()
+            return resp.json()
+        except httpx.TimeoutException as exc:
+            raise ServicioUsuariosTimeout(
+                "Timeout al consultar Servicio Usuarios"
+            ) from exc
+        except httpx.RequestError as exc:
+            raise ServicioUsuariosNoDisponible(
+                f"No se pudo conectar con Servicio Usuarios: {exc}"
+            ) from exc
+
+    try:
+        usuario = obtener_usuario_bd(usuario_id)
+        if not usuario:
+            raise UsuarioNoEncontrado(f"Usuario {usuario_id} no existe en la base de datos")
+        return usuario
+    except UsuarioNoEncontrado:
+        raise
+    except SQLAlchemyError as exc:
+        raise ServicioUsuariosNoDisponible(
+            f"Error de base de datos al consultar usuarios: {exc}"
+        ) from exc
